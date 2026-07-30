@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
+
+# yt-summarize agent summaries sometimes written into the skill cwd during tests
+*gguf*.md

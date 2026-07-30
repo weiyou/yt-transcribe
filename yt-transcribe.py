@@ -68,7 +68,10 @@ FFMPEG_BIN = os.environ.get("YT_TRANSCRIBE_FFMPEG", "ffmpeg")
 FFPROBE_BIN = os.environ.get("YT_TRANSCRIBE_FFPROBE", "ffprobe")
 
 DEFAULT_BACKEND = os.environ.get("YT_TRANSCRIBE_BACKEND", "whisper-cpp")
-DEFAULT_LANGUAGE = os.environ.get("YT_TRANSCRIBE_LANGUAGE", "en")
+# Default auto-detect: forcing `en` on Mandarin/etc. is a classic Whisper
+# failure mode (plausible-sentence loops). Pin with --language en when you
+# know the audio is English and want a small speed/accuracy edge.
+DEFAULT_LANGUAGE = os.environ.get("YT_TRANSCRIBE_LANGUAGE", "auto")
 
 # Whisper wants 16 kHz mono PCM; anything else is resampled internally at best
 # and rejected at worst, so normalize once up front.
@@ -309,7 +312,7 @@ class WhisperCppBackend(Backend):
                 "large-v3-turbo-q5_0",
                 "ggml-large-v3-turbo-q5_0.bin",
                 547,
-                "recommended: large-v3-class English accuracy, smallest turbo",
+                "recommended: multilingual large-v3 turbo, smallest footprint",
             ),
             _ggml(
                 "large-v3-turbo-q8_0",
@@ -395,6 +398,16 @@ class WhisperCppBackend(Backend):
         self, wav: Path, model: ModelSpec, opts: TranscribeOptions
     ) -> list[dict]:
         weights = self.ensure_weights(model)
+        lang = (opts.language or "auto").strip() or "auto"
+        if _is_english_only_model(model.key) and lang not in ("en", "auto"):
+            # English-only weights cannot emit other languages.
+            print(
+                f"LANGUAGE_WARN: model {model.key} is English-only; "
+                f"--language {lang} will not produce {lang} text. "
+                "Use a multilingual model (default large-v3-turbo-*) "
+                "or --language en/auto.",
+                file=sys.stderr,
+            )
         with tempfile.TemporaryDirectory(prefix="yt-transcribe-cpp-") as td:
             out_prefix = Path(td) / "out"
             cmd = [
@@ -405,10 +418,7 @@ class WhisperCppBackend(Backend):
                 "--output-file", str(out_prefix),
                 "--print-progress",
             ]
-            if opts.language and opts.language != "auto":
-                cmd += ["--language", opts.language]
-            else:
-                cmd += ["--language", "auto"]
+            cmd += ["--language", lang if lang != "auto" else "auto"]
             if opts.threads:
                 cmd += ["--threads", str(opts.threads)]
             if opts.initial_prompt:
@@ -433,6 +443,10 @@ class WhisperCppBackend(Backend):
             if not json_path.is_file():
                 raise RuntimeError(f"whisper-cli wrote no JSON at {json_path}")
             data = json.loads(json_path.read_text(encoding="utf-8"))
+
+        detected = _language_from_whisper_json(data)
+        if detected:
+            print(f"LANGUAGE_DETECTED: {detected}")
 
         segments: list[dict] = []
         for item in data.get("transcription") or []:
@@ -512,8 +526,9 @@ class MlxWhisperBackend(Backend):
                 "--output-format", "json",
                 "--output-dir", td,
             ]
-            if opts.language and opts.language != "auto":
-                cmd += ["--language", opts.language]
+            lang = (opts.language or "auto").strip() or "auto"
+            if lang and lang != "auto":
+                cmd += ["--language", lang]
             if opts.initial_prompt:
                 cmd += ["--initial-prompt", opts.initial_prompt]
             cmd += opts.extra_args
@@ -529,6 +544,10 @@ class MlxWhisperBackend(Backend):
             if not produced:
                 raise RuntimeError("mlx_whisper wrote no JSON output")
             data = json.loads(produced[0].read_text(encoding="utf-8"))
+
+        detected = data.get("language") or _language_from_whisper_json(data)
+        if detected:
+            print(f"LANGUAGE_DETECTED: {detected}")
 
         segments: list[dict] = []
         for item in data.get("segments") or []:
@@ -650,20 +669,72 @@ def probe_duration(path: Path) -> float | None:
 # quality assessment
 # ---------------------------------------------------------------------------
 
+# Hiragana, Katakana, CJK ideographs, Hangul — space-less scripts for token counts.
+_CJK_LIKE_RE = re.compile(
+    r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]"
+)
+
+
+def _language_from_whisper_json(data: dict) -> str | None:
+    """Pull detected/forced language from whisper.cpp or mlx JSON if present."""
+    result = data.get("result")
+    if isinstance(result, dict):
+        lang = result.get("language")
+        if lang:
+            return str(lang)
+    lang = data.get("language")
+    if lang:
+        return str(lang)
+    params = data.get("params")
+    if isinstance(params, dict) and params.get("language"):
+        return str(params["language"])
+    return None
+
+
+def _is_english_only_model(model_key: str) -> bool:
+    """True for whisper.cpp keys like tiny.en / medium.en-q5_0 / small.en-q5_1."""
+    k = model_key.lower()
+    return ".en" in k or k.endswith("en")
+
+
 def _norm(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+    """Normalize segment text for duplicate detection across scripts.
+
+    Earlier this stripped everything but ASCII, which made every CJK segment
+    compare as empty — so Mandarin/Japanese loops were invisible to the
+    repetition gate. Keep letters from any script (Unicode \\w) plus digits.
+    """
+    t = text.casefold().strip()
+    t = re.sub(r"[^\w\s]+", "", t, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", t).strip()
 
 
-def assess_quality(segments: list[dict], duration: float | None) -> dict:
+def _token_count(text: str) -> int:
+    """Rough token count: whitespace words for spaced scripts, chars for CJK."""
+    if not text:
+        return 0
+    cjk_chars = len(_CJK_LIKE_RE.findall(text))
+    remainder = _CJK_LIKE_RE.sub(" ", text)
+    latin_words = len(remainder.split())
+    return cjk_chars + latin_words
+
+
+def assess_quality(
+    segments: list[dict],
+    duration: float | None,
+    *,
+    language: str | None = None,
+) -> dict:
     """Score a transcript for the two ways ASR fails on non-speech audio.
 
     speech_ratio  — how much of the runtime the segments actually cover. With
                     VAD on, music and silence are skipped, so a low ratio is a
                     strong "this isn't a talking video" signal.
     repetition    — share of segments whose text duplicates another segment.
-                    Whisper answers non-speech by looping one plausible line.
+                    Whisper answers non-speech (and wrong-language audio) by
+                    looping one plausible line.
     """
-    texts = [_norm(s["text"]) for s in segments if _norm(s["text"])]
+    texts = [_norm(s["text"]) for s in segments if _norm(s.get("text", ""))]
     covered = sum(max(s["end"] - s["start"], 0.0) for s in segments)
     speech_ratio = (covered / duration) if duration and duration > 0 else None
 
@@ -693,12 +764,21 @@ def assess_quality(segments: list[dict], duration: float | None) -> dict:
     if longest_run >= 10:
         reasons.append(f"{longest_run} identical segments in a row")
 
+    # Wrong forced language (e.g. --language en on Mandarin) produces the same
+    # loop pattern as music. Surface a fix when the operator pinned a language.
+    lang = (language or "").strip().lower()
+    if reasons and lang and lang not in ("auto", ""):
+        reasons.append(
+            f"language was forced to {lang!r}; if the audio is another "
+            "language (or bilingual), re-run with --language auto"
+        )
+
     return {
         "speech_ratio": speech_ratio,
         "repetition": repetition,
         "longest_run": longest_run,
         "segments": len(segments),
-        "words": sum(len(t.split()) for t in texts),
+        "words": sum(_token_count(s.get("text", "")) for s in segments),
         "suspect": bool(reasons),
         "reasons": reasons,
     }
@@ -781,7 +861,11 @@ def main() -> None:
     parser.add_argument(
         "--language",
         default=DEFAULT_LANGUAGE,
-        help=f"Spoken language, or 'auto' to detect (default: {DEFAULT_LANGUAGE})",
+        help=(
+            f"Spoken language code (e.g. en, zh, ja), or 'auto' to detect "
+            f"(default: {DEFAULT_LANGUAGE}). Forcing the wrong language "
+            "often causes repetition loops — prefer auto unless sure."
+        ),
     )
     parser.add_argument(
         "--no-vad",
@@ -887,6 +971,7 @@ def main() -> None:
 
     print(f"BACKEND: {backend.key}")
     print(f"ASR_MODEL: {model.key}")
+    print(f"LANGUAGE: {args.language}")
 
     try:
         cookies_path = resolve_cookies_path(args.cookies)
@@ -946,7 +1031,7 @@ def main() -> None:
         sys.exit(EXIT_SUSPECT)
 
     entries = to_entries(segments)
-    quality = assess_quality(segments, duration)
+    quality = assess_quality(segments, duration, language=args.language)
 
     print(f"SEGMENTS: {quality['segments']}")
     print(f"WORDS: {quality['words']}")
@@ -973,9 +1058,9 @@ def main() -> None:
         for r in quality["reasons"]:
             print(f"  - {r}")
         print(
-            "This usually means the audio is music or otherwise not speech. "
-            "Do not summarize it as if it were a talk without checking with "
-            "the user first."
+            "This usually means the audio is music, non-speech, or the wrong "
+            "language was forced (try --language auto). Do not summarize it "
+            "as if it were a talk without checking with the user first."
         )
         sys.exit(EXIT_SUSPECT)
 

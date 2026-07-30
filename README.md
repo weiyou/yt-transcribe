@@ -56,8 +56,11 @@ inline, `uv run`).
 uv run yt-transcribe.py --list-models
 ```
 
-Default is whisper.cpp `large-v3-turbo-q5_0` (~547MB): large-v3-class English
-accuracy at the smallest turbo footprint, ~1–2s model load, Metal-accelerated.
+Default is whisper.cpp `large-v3-turbo-q5_0` (~547MB): multilingual large-v3
+turbo at the smallest footprint, ~1–2s model load, Metal-accelerated. Language
+defaults to **`auto`** (override with `--language en` / `zh` / …). Forcing the
+wrong language — especially `en` on Mandarin or other non-English speech — is a
+common cause of hallucination loops; prefer `auto` unless you know the language.
 `--backend mlx-whisper` runs Whisper on MLX via `uvx` instead. Adding an engine
 is one `Backend` subclass plus a line in `BACKENDS`.
 
@@ -69,11 +72,12 @@ extra threads contend for four performance cores.
 ## Quality gating
 
 Videos with captions disabled skew toward music and studio content, and Whisper
-answers non-speech audio by looping one plausible sentence for the whole
-runtime — output that reads fine and is entirely fabricated. Every run reports
-`SPEECH_RATIO` and `REPETITION`, and exits **3** with `ASR_QUALITY: suspect`
-when the audio looks like music or the output looks looped. Silero VAD is on by
-default, which suppresses most of it.
+answers non-speech audio (or audio in a **wrong forced language**) by looping
+one plausible sentence for the whole runtime — output that reads fine and is
+entirely fabricated. Every run reports `SPEECH_RATIO` and `REPETITION`, and
+exits **3** with `ASR_QUALITY: suspect` when the audio looks like music or the
+output looks looped. Silero VAD is on by default, which suppresses most of it.
+Repetition detection is script-aware (CJK included), not ASCII-only.
 
 Exit codes: `0` transcript written · `1` ordinary failure · `3` written but
 quality suspect — review before summarizing.

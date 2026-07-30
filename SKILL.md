@@ -87,11 +87,17 @@ and is entirely fabricated. The script measures two signals and prints them:
   on, music and silence are skipped, so a low ratio means "not a talking
   video" (default threshold 30%).
 - `REPETITION: N%` — share of duplicate segments (default threshold 55%), plus
-  a check for ≥10 identical segments in a row.
+  a check for ≥10 identical segments in a row. Duplicate detection keeps CJK
+  and other non-ASCII letters (not ASCII-only).
+- `LANGUAGE:` / `LANGUAGE_DETECTED:` — requested language and, when the engine
+  reports it, the detected code.
 
-On exit 3, tell the user the audio appears to be music/non-speech and quote the
-numbers. Do **not** summarize it as though it were a talk unless they confirm.
-The transcript is still cached, so proceeding later costs nothing extra.
+On exit 3, tell the user the audio appears to be music/non-speech **or a
+wrong-language force** and quote the numbers. If language was not `auto`,
+suggest re-running with `--language auto` (forcing `en` on Mandarin/etc. is a
+classic Whisper loop). Do **not** summarize it as though it were a talk unless
+they confirm. The transcript is still cached, so proceeding later costs nothing
+extra.
 
 ## Models
 
@@ -111,7 +117,7 @@ model load, no Python import cost, native segment timestamps.
 
 | `--asr-model` | Size | Notes |
 |---------------|------|-------|
-| **`large-v3-turbo-q5_0`** *(default)* | ~547MB | large-v3-class English accuracy at the smallest turbo footprint |
+| **`large-v3-turbo-q5_0`** *(default)* | ~547MB | multilingual large-v3 turbo at the smallest footprint |
 | `large-v3-turbo-q8_0` | ~833MB | a little more headroom |
 | `large-v3-turbo` | ~1.5GB | unquantized; rarely worth the extra GB |
 | `large-v3-q5_0` | ~1.0GB | non-turbo: several times slower, marginal English gain |
@@ -142,11 +148,11 @@ on Apple silicon and it does not loop on non-speech.
 
 | Flag | Effect |
 |------|--------|
-| *(none)* | whisper-cpp + `large-v3-turbo-q5_0` + VAD, English |
+| *(none)* | whisper-cpp + `large-v3-turbo-q5_0` + VAD, language `auto` |
 | `--backend {whisper-cpp,mlx-whisper}` | ASR engine |
 | `--asr-model <key>` | Model within the backend |
 | `--list-models` | Backends, models, availability — then exit |
-| `--language <code>` | Spoken language, or `auto` to detect (default `en`) |
+| `--language <code>` | Spoken language (`en`, `zh`, …), or `auto` to detect (default `auto`) |
 | `--no-vad` | Disable Silero VAD (VAD is what suppresses music hallucination) |
 | `--threads N` | ASR threads — see the note below before raising it |
 | `--prompt <text>` | Initial prompt to bias spelling of names/jargon |
@@ -195,8 +201,13 @@ is the only way to spend the compute again.
 - The Silero VAD model (`ggml-silero-v5.1.2.bin`) is fetched once alongside the
   first whisper-cpp model. If that download fails, the run continues without
   VAD and says so.
+- **Language:** default is `auto`. Pin with `--language en` only when you know
+  the audio is English (small speed/accuracy edge). For Chinese, Japanese,
+  bilingual docs, etc., leave `auto` or set the right code (`zh`, `ja`, …).
+  English-only models (`*.en*`) cannot emit other languages — the script warns
+  if you force a non-English code with one of them.
 - Env: `YT_TRANSCRIBE_BACKEND`, `YT_TRANSCRIBE_MODEL`,
-  `YT_TRANSCRIBE_MODEL_DIR`, `YT_TRANSCRIBE_LANGUAGE`,
+  `YT_TRANSCRIBE_MODEL_DIR`, `YT_TRANSCRIBE_LANGUAGE` (default `auto`),
   `YT_TRANSCRIBE_WHISPER_CPP` (binary path), `YT_TRANSCRIBE_FFMPEG`,
   `YT_TRANSCRIBE_FFPROBE`, `YT_TRANSCRIBE_MIN_SPEECH_RATIO` (0.30),
   `YT_TRANSCRIBE_MAX_REPETITION` (0.55), `YT_TRANSCRIBE_COOKIES`,
