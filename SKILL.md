@@ -1,38 +1,43 @@
 ---
 name: yt-transcribe
 description: >
-  Transcribe speech to a timestamped transcript with a local ASR model
-  (whisper.cpp by default), for a YouTube video or a local audio/video file.
-  Use when a video has no caption track — i.e. yt-summarize exited 2 with
-  NO_TRANSCRIPT — or to transcribe a podcast, meeting recording, or media file.
-  Writes yt-summarize's transcript cache, so afterwards a plain
-  `yt-summarize.py <id>` summarizes it with no extra flags. Runs the model
-  on demand in a subprocess (nothing stays resident) and reports
-  ASR_QUALITY: suspect with exit 3 when the audio is music or non-speech.
+  Transcribe speech to a timestamped plain-text transcript with a local ASR
+  model (whisper.cpp by default), for a YouTube video or a local audio/video
+  file. Use when a video has no caption track — i.e. yt-summarize exited 2
+  with NO_TRANSCRIPT — or to transcribe a podcast, meeting recording, or media
+  file. Writes ./<id>.txt with one [HH:MM:SS] line per segment, and also
+  yt-summarize's JSON cache for optional later reuse. Runs the model on demand
+  in a subprocess (nothing stays resident) and reports ASR_QUALITY: suspect
+  with exit 3 when the audio is music or non-speech.
 ---
 
 # yt-transcribe
 
-Speech-to-text for audio that has no captions, producing the same timestamped
-transcript shape that [[yt-summarize]] consumes.
+Speech-to-text for audio that has no captions. Primary deliverable is a
+**plain-text transcript** in the current working directory.
 
-## How it composes with yt-summarize
+## Output
 
-There is no call graph between the two skills — they share a **file
-contract**. `yt-summarize.py`'s `fetch_transcript()` checks its transcript
-cache first, so this script's only integration duty is to write that file:
+After a successful run:
+
+```
+./<video-id>.txt
+[00:00:04] first segment text
+[00:00:12] second segment text
+…
+```
+
+Also writes (unless `--no-cache-write`):
 
 ```
 ~/.cache/yt-summarize/<video-id>.transcript.json
-[{"start": 12.34, "seconds": 12, "text": "..."}, ...]
 ```
 
-Once that exists, `yt-summarize.py <id>` finds it on the cache-hit path and
-summarizes normally. **Do not pipe the transcript through your own context to
-hand it to yt-summarize** — an hour of speech is 50–100k characters, and the
-cache already carries it losslessly.
+so a later `yt-summarize.py <id>` can reuse the ASR work if desired. **Do not
+automatically run yt-summarize after this skill** — hand the user the `.txt`
+(or summarize only if they ask).
 
-Honor `YT_SUMMARIZE_CACHE_DIR` if it is set; both scripts read the same var.
+Honor `YT_SUMMARIZE_CACHE_DIR` if set (JSON cache location).
 
 ## Usage
 
@@ -41,8 +46,7 @@ uv run /Users/wei/.pi/agent/skills/yt-transcribe/yt-transcribe.py <video-id-or-u
 ```
 
 Copy that path **exactly as written** and stay in your current working
-directory — same rule as yt-summarize. Nothing is written to the cwd unless
-you pass `--out`.
+directory — the `.txt` is written to the cwd (override with `--out`).
 
 **Set your shell tool's timeout to at least 1800 seconds.** Transcription is
 minutes of compute, not a network fetch. Measured on a 16GB M1 MacBook Air
@@ -50,31 +54,33 @@ with the default model: **~6.4x realtime**, i.e. an 18:39 video took 2:55 of
 ASR, so budget **~10 minutes per hour of audio**, plus the audio download and a
 one-time ~550MB model download on first run.
 
-Local files work too, and are the standalone use of this skill:
+Local files work too:
 
 ```bash
 uv run …/yt-transcribe.py ~/Recordings/standup.m4a --out standup.txt
 ```
 
-## The normal sequence
+## Workflow
 
-When yt-summarize has already reported `NO_TRANSCRIPT` / exit 2:
+When yt-summarize has already reported `NO_TRANSCRIPT` / exit 2, or the user
+asks for a transcript:
 
-1. **Ask the user first.** yt-summarize's `NO_TRANSCRIPT` verdict is terminal
-   for the caption route and stays that way — transcription is a different,
-   far more expensive route (minutes of CPU/GPU, a model download). Offer it;
-   run it only when the user says yes.
-2. Run `yt-transcribe.py <id>`.
-3. Read `ASR_QUALITY:` and the exit code (below).
-4. On success, run `yt-summarize.py <id>` exactly as you normally would. It
-   will print `TRANSCRIPT_CACHE: hit`. Everything downstream — chunking, the
-   local summarizer, the Part A/Part B spec — is unchanged.
+1. **Ask the user first** if this was only offered as an expensive alternative
+   to captions (minutes of CPU/GPU, possible model download). Run only when
+   they want it.
+2. Run `yt-transcribe.py <id>` with timeout ≥ 1800s.
+3. Read `ASR_QUALITY:`, exit code, and `TRANSCRIPT_FILE:`.
+4. On success, **show the user the path to the `.txt`** (and optionally a short
+   preview). Do **not** chain into yt-summarize unless the user asks.
 
-## Exit codes — read these before summarizing
+Re-running with a cache hit rewrites the `.txt` from the JSON without ASR
+(`TRANSCRIPT_CACHE: hit`). Use `--force` to re-transcribe.
+
+## Exit codes
 
 | Exit | Meaning | What to do |
 |------|---------|------------|
-| `0` | Transcript written, `ASR_QUALITY: ok` | Proceed to yt-summarize |
+| `0` | Transcript written, `ASR_QUALITY: ok` | Point user at `TRANSCRIPT_FILE` |
 | `1` | Ordinary failure (bad id, download error, engine missing) | Read the error; one retry may be worth it |
 | `3` | Transcript written but `ASR_QUALITY: suspect` | **Stop and check with the user** |
 
@@ -95,9 +101,7 @@ and is entirely fabricated. The script measures two signals and prints them:
 On exit 3, tell the user the audio appears to be music/non-speech **or a
 wrong-language force** and quote the numbers. If language was not `auto`,
 suggest re-running with `--language auto` (forcing `en` on Mandarin/etc. is a
-classic Whisper loop). Do **not** summarize it as though it were a talk unless
-they confirm. The transcript is still cached, so proceeding later costs nothing
-extra.
+classic Whisper loop). The `.txt` is still written — review before trusting it.
 
 ## Models
 
@@ -125,10 +129,6 @@ model load, no Python import cost, native segment timestamps.
 | `small.en-q5_1` | ~181MB | fast triage only |
 | `base.en` / `tiny.en` | ~141/74MB | smoke-testing the pipeline |
 
-Avoid the small models for real summaries: the output format anchors **every
-paragraph** to a transcript timestamp, and timestamp drift at that end of the
-range corrupts the anchors even where the words are right.
-
 ### mlx-whisper
 
 `--backend mlx-whisper`, run via `uvx` so nothing installs permanently. Costs
@@ -148,7 +148,7 @@ on Apple silicon and it does not loop on non-speech.
 
 | Flag | Effect |
 |------|--------|
-| *(none)* | whisper-cpp + `large-v3-turbo-q5_0` + VAD, language `auto` |
+| *(none)* | whisper-cpp + `large-v3-turbo-q5_0` + VAD, language `auto`; write `./<id>.txt` |
 | `--backend {whisper-cpp,mlx-whisper}` | ASR engine |
 | `--asr-model <key>` | Model within the backend |
 | `--list-models` | Backends, models, availability — then exit |
@@ -156,10 +156,10 @@ on Apple silicon and it does not loop on non-speech.
 | `--no-vad` | Disable Silero VAD (VAD is what suppresses music hallucination) |
 | `--threads N` | ASR threads — see the note below before raising it |
 | `--prompt <text>` | Initial prompt to bias spelling of names/jargon |
-| `--video-id <id>` | Cache key to write under (for local files, or to override) |
+| `--video-id <id>` | Cache key / default `.txt` stem (for local files, or to override) |
 | `--force` | Re-transcribe even when a cached transcript exists |
-| `--no-cache-write` | Don't touch yt-summarize's cache |
-| `--out PATH` | Also write a plain `[m:ss]` transcript |
+| `--no-cache-write` | Don't write the yt-summarize JSON cache |
+| `--out PATH` | Plain-text path (default: `./<video-id>.txt`) |
 | `--keep-audio DIR` | Keep downloaded/normalized audio instead of a temp dir |
 | `--cookies PATH` | Netscape cookies.txt for restricted videos |
 | `--engine-arg ARG` | Raw passthrough to the engine (repeatable) |
@@ -167,37 +167,29 @@ on Apple silicon and it does not loop on non-speech.
 **Accepted inputs:** bare id, `watch?v=`, `youtu.be`, `/embed/`, `/shorts/`,
 or a path to any local audio/video file.
 
-Re-running with a cached transcript present is a no-op that prints
-`TRANSCRIPT_CACHE: hit` and exits 0 — safe to call speculatively, and `--force`
-is the only way to spend the compute again.
-
 ## Notes
 
 - **Pipeline:** `yt-dlp -f bestaudio --extract-audio` → ffmpeg to 16kHz mono
-  PCM WAV (whisper requires it) → engine → segments → cache. Audio lands in a
-  temp dir that is deleted afterwards unless `--keep-audio` is set.
+  PCM WAV (whisper requires it) → engine → segments → `.txt` + optional JSON
+  cache. Audio lands in a temp dir that is deleted afterwards unless
+  `--keep-audio` is set.
 - **Don't raise `--threads`.** Measured on an M1 Air over the same 18:39 clip:
   4 threads (whisper-cli's default) 2:55, `-t 8` **3:16** — slower, because the
   encode runs on Metal and eight ASR threads contend for four performance
   cores. Dropping VAD didn't help either (3:12), so the default of VAD-on at 4
   threads is both the fastest and the safest setting.
 - **`--prompt` is worth using** on technical talks: it biases spelling of
-  product names and jargon that ASR otherwise mangles. Note that yt-summarize's
-  spec tells the summarizer to copy technical tokens *exactly as the transcript
-  renders them*, so a misheard product name propagates into the summary
-  verbatim. Fixing it at the ASR step is the only clean fix.
-- **Memory on a 16GB machine:** the engine is a subprocess that exits before
-  you invoke yt-summarize, so a resident llama-server on `:8080` (several GB
-  for a 4-bit 9B) and a ~550MB Whisper never need to be loaded at once. Don't
-  restructure this into one long-lived process without a reason.
+  product names and jargon that ASR otherwise mangles.
+- **Memory on a 16GB machine:** the engine is a subprocess that exits when
+  done, so a resident llama-server and a ~550MB Whisper never need to be
+  loaded at once.
 - **yt-dlp runs with `--ignore-config`**, so a personal
   `~/.config/yt-dlp/config` cannot leak format selectors or its own
   `--cookies` line into the audio fetch. Cookies come only from `--cookies` /
   `YT_TRANSCRIBE_COOKIES` / `YT_SUMMARIZE_COOKIES` / `~/cookies.txt`.
 - Deps are [PEP 723](https://peps.python.org/pep-0723/) inline and **stdlib
-  only** — deliberately, so yt-summarize's fast caption path never pays for
-  MLX/torch resolution. Required on `PATH`: `ffmpeg`/`ffprobe`, plus `yt-dlp`
-  for YouTube sources and an ASR engine per `--list-models`.
+  only**. Required on `PATH`: `ffmpeg`/`ffprobe`, plus `yt-dlp` for YouTube
+  sources and an ASR engine per `--list-models`.
 - The Silero VAD model (`ggml-silero-v5.1.2.bin`) is fetched once alongside the
   first whisper-cpp model. If that download fails, the run continues without
   VAD and says so.

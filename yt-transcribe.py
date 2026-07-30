@@ -7,15 +7,16 @@
 """
 Transcribe speech to a timestamped transcript with a local ASR model.
 
-Built for videos that carry no caption track, where yt-summarize exits 2 with
-NO_TRANSCRIPT. The output is written in yt-summarize's own transcript cache
-format, so once this script has run, a plain `yt-summarize.py <id>` picks the
-transcript up on its cache-hit path with no flags and no changes.
+Writes:
+  - a raw plain-text transcript in the cwd: <id>.txt  ([HH:MM:SS] line per
+    segment), override with --out
+  - optionally yt-summarize's JSON cache (~/.cache/yt-summarize/…) so a later
+    summarize can reuse the audio work
 
 Usage:
     uv run yt-transcribe.py <video-id-or-url>
     uv run yt-transcribe.py ./recording.m4a --video-id my-recording
-    uv run yt-transcribe.py <id> --asr-model large-v3-turbo-q8_0
+    uv run yt-transcribe.py <id> --out /tmp/talk.txt
     uv run yt-transcribe.py --list-models
 
 Deps are stdlib only; the ASR engines are external binaries/tools discovered
@@ -25,7 +26,7 @@ Exit codes:
     0  transcript written
     1  ordinary failure (bad id, download error, engine missing/failed)
     3  transcript written but quality is suspect (music / non-speech / looped
-       output) — review before summarizing
+       output) — review before treating it as speech
 """
 
 import argparse
@@ -130,10 +131,11 @@ def extract_video_id(raw: str) -> str | None:
 
 
 def format_timestamp(seconds: float) -> str:
-    total = int(seconds)
+    """Always [HH:MM:SS]-ready: zero-padded hours, minutes, seconds."""
+    total = max(int(seconds), 0)
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def resolve_cookies_path(explicit: str | None = None) -> Path | None:
@@ -800,16 +802,28 @@ def to_entries(segments: list[dict]) -> list[dict]:
     ]
 
 
-def summarize_hint(video_id: str) -> str:
-    """The exact next command, resolved against the sibling yt-summarize skill."""
-    sibling = Path(__file__).resolve().parent.parent / "yt-summarize" / "yt-summarize.py"
-    script = sibling if sibling.is_file() else Path("<path-to>/yt-summarize.py")
-    return f"uv run {script} {video_id}"
-
-
 def cache_path_for(video_id: str) -> Path:
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", video_id)
     return CACHE_DIR / f"{safe_id}.transcript.json"
+
+
+def default_transcript_path(video_id: str) -> Path:
+    """Cwd plain-text path: <video-id>.txt"""
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", video_id)
+    return Path.cwd() / f"{safe_id}.txt"
+
+
+def resolve_out_path(video_id: str, explicit: str | None) -> Path:
+    if explicit is not None and str(explicit).strip():
+        return Path(str(explicit)).expanduser()
+    return default_transcript_path(video_id)
+
+
+def load_cache_entries(path: Path) -> list[dict]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"cache is not a JSON list: {path}")
+    return data
 
 
 def write_cache(video_id: str, entries: list[dict]) -> Path:
@@ -822,8 +836,19 @@ def write_cache(video_id: str, entries: list[dict]) -> Path:
 
 
 def write_transcript_text(path: Path, entries: list[dict]) -> None:
-    body = "\n".join(f"[{format_timestamp(e['start'])}] {e['text']}" for e in entries)
-    path.write_text(body + "\n", encoding="utf-8")
+    """One line per segment: [HH:MM:SS] text"""
+    lines = []
+    for e in entries:
+        start = e.get("start", e.get("seconds", 0))
+        try:
+            start_f = float(start)
+        except (TypeError, ValueError):
+            start_f = 0.0
+        text = (e.get("text") or "").strip()
+        lines.append(f"[{format_timestamp(start_f)}] {text}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +859,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Transcribe a YouTube video or local media file with a local ASR "
-            "model, into yt-summarize's transcript cache."
+            "model. Writes a plain [HH:MM:SS] .txt transcript (cwd) and "
+            "optionally yt-summarize's JSON cache."
         )
     )
     parser.add_argument(
@@ -900,7 +926,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--out",
-        help="Also write a plain [m:ss] transcript to this path",
+        help=(
+            "Plain-text transcript path ([HH:MM:SS] per line). "
+            "Default: ./<video-id>.txt in the current working directory"
+        ),
     )
     parser.add_argument(
         "--keep-audio",
@@ -955,11 +984,33 @@ def main() -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(EXIT_FAIL)
 
+    out_path = resolve_out_path(video_id, args.out)
     cache_file = cache_path_for(video_id)
+
+    # Cache hit: re-export plain text from the JSON; no ASR re-run.
     if cache_file.exists() and not args.force and not args.no_cache_write:
-        print(f"TRANSCRIPT_CACHE: hit ({cache_file}) — nothing to do")
+        print(f"TRANSCRIPT_CACHE: hit ({cache_file})")
+        try:
+            entries = load_cache_entries(cache_file)
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            print(f"Error reading cache: {e}", file=sys.stderr)
+            sys.exit(EXIT_FAIL)
+        write_transcript_text(out_path, entries)
+        print(f"TRANSCRIPT_FILE: {out_path.resolve()}")
+        print(f"SEGMENTS: {len(entries)}")
+        preview = entries[: min(3, len(entries))]
+        print("PREVIEW:")
+        for e in preview:
+            text = (e.get("text") or "")
+            if len(text) > 100:
+                text = text[:97] + "…"
+            start = e.get("start", e.get("seconds", 0))
+            try:
+                start_f = float(start)
+            except (TypeError, ValueError):
+                start_f = 0.0
+            print(f"  [{format_timestamp(start_f)}] {text}")
         print("Pass --force to re-transcribe.")
-        print(f"NEXT: {summarize_hint(video_id)}")
         return
 
     # Engine availability is checked only once we know we must actually run:
@@ -1042,10 +1093,9 @@ def main() -> None:
     if not args.no_cache_write:
         written = write_cache(video_id, entries)
         print(f"TRANSCRIPT_CACHE: wrote {written}")
-    if args.out:
-        out_path = Path(args.out).expanduser()
-        write_transcript_text(out_path, entries)
-        print(f"TRANSCRIPT_FILE: {out_path}")
+
+    write_transcript_text(out_path, entries)
+    print(f"TRANSCRIPT_FILE: {out_path.resolve()}")
 
     preview = entries[: min(3, len(entries))]
     print("PREVIEW:")
@@ -1059,13 +1109,12 @@ def main() -> None:
             print(f"  - {r}")
         print(
             "This usually means the audio is music, non-speech, or the wrong "
-            "language was forced (try --language auto). Do not summarize it "
-            "as if it were a talk without checking with the user first."
+            "language was forced (try --language auto). Review the "
+            "TRANSCRIPT_FILE before treating it as speech."
         )
         sys.exit(EXIT_SUSPECT)
 
     print("ASR_QUALITY: ok")
-    print(f"NEXT: {summarize_hint(video_id)}")
 
 
 if __name__ == "__main__":

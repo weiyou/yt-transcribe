@@ -1,44 +1,36 @@
 # yt-transcribe
 
-Local speech-to-text for audio that has no captions, producing the timestamped
-transcript format that [yt-summarize](../yt-summarize) consumes.
-
-Built for the case where `yt-summarize` exits 2 with `NO_TRANSCRIPT` — the
-uploader disabled captions and YouTube never generated an ASR track — but it
-works equally well on any local audio or video file.
+Local speech-to-text for audio that has no captions. Writes a **plain-text
+transcript** with one timestamped line per segment, and optionally the JSON
+cache that [yt-summarize](../yt-summarize) can reuse later.
 
 ```bash
-# a YouTube video with no captions
+# YouTube (or bare id) → ./I2CK-j-pR7M.txt
 uv run yt-transcribe.py <video-id-or-url>
 
-# then summarize it exactly as usual — the transcript is already cached
-uv run ../yt-summarize/yt-summarize.py <video-id>
-
-# or a local recording
+# local recording
 uv run yt-transcribe.py ~/Recordings/standup.m4a --out standup.txt
 ```
 
-## How it composes
+## Output
 
-The two skills share a **file contract**, not a call graph.
-`yt-summarize.py`'s `fetch_transcript()` checks its transcript cache before
-hitting the network, so this script's whole integration duty is to write that
-file:
+```
+[00:00:04] first segment
+[00:00:12] second segment
+```
+
+Default path: `./<video-id>.txt` in the current working directory (`--out` to
+override). On a cache hit, the script re-exports that `.txt` from the JSON
+without re-running ASR (`--force` to re-transcribe).
+
+JSON cache (optional integration with yt-summarize):
 
 ```
 ~/.cache/yt-summarize/<video-id>.transcript.json
-[{"start": 12.34, "seconds": 12, "text": "..."}, ...]
 ```
 
-After that, a plain `yt-summarize.py <id>` finds it on the cache-hit path and
-behaves identically to a captioned video — same chunking, same summarizer, same
-Part A/Part B output. No flags, and no code change on the yt-summarize side.
-
-Keeping the engine in a separate process also keeps the dependencies apart:
-yt-summarize's fast caption path stays at two light Python deps and never pays
-for an MLX/ASR resolution, and the ~550MB Whisper model is unloaded before a
-resident `llama-server` is asked to summarize — which matters on a 16GB
-machine.
+There is **no automatic handoff** to yt-summarize — run that only if you want
+a structured summary after the raw transcript exists.
 
 ## Requirements
 
@@ -80,6 +72,6 @@ output looks looped. Silero VAD is on by default, which suppresses most of it.
 Repetition detection is script-aware (CJK included), not ASCII-only.
 
 Exit codes: `0` transcript written · `1` ordinary failure · `3` written but
-quality suspect — review before summarizing.
+quality suspect — review the `.txt` before trusting it.
 
 See [SKILL.md](SKILL.md) for the full flag and environment reference.
