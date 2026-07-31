@@ -2,13 +2,9 @@
 name: yt-transcribe
 description: >
   Transcribe speech to a timestamped plain-text transcript with a local ASR
-  model (whisper.cpp by default), for a YouTube video or a local audio/video
-  file. Use when a video has no caption track — i.e. yt-summarize exited 2
-  with NO_TRANSCRIPT — or to transcribe a podcast, meeting recording, or media
-  file. Writes ./<id>.txt with one [HH:MM:SS] line per segment, and also
-  yt-summarize's JSON cache for optional later reuse. Runs the model on demand
-  in a subprocess (nothing stays resident) and reports ASR_QUALITY: suspect
-  with exit 3 when the audio is music or non-speech.
+  model (whisper.cpp), for a YouTube video or a local audio/video file. Use
+  when a video has no caption track — yt-summarize exited 2 with NO_TRANSCRIPT
+  — or to transcribe a podcast, meeting recording, or media file.
 ---
 
 # yt-transcribe
