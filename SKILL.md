@@ -58,19 +58,20 @@ uv run …/yt-transcribe.py ~/Recordings/standup.m4a --out standup.txt
 
 ## Workflow
 
-When yt-summarize has already reported `NO_TRANSCRIPT` / exit 2, or the user
-asks for a transcript:
+When the user asks for a transcript, or yt-summarize has reported
+`NO_TRANSCRIPT` / exit 2:
 
-1. **Ask the user first** if this was only offered as an expensive alternative
-   to captions (minutes of CPU/GPU, possible model download). Run only when
-   they want it.
-2. Run `yt-transcribe.py <id>` with timeout ≥ 1800s.
-3. Read `ASR_QUALITY:`, exit code, and `TRANSCRIPT_FILE:`.
-4. On success, **show the user the path to the `.txt`** (and optionally a short
+1. Check the two output paths above for this source (the JSON cache and
+   `./<video-id>.txt`). For a local file, the cache key and `.txt` stem are
+   `--video-id` if one was given, otherwise the filename stem.
+2. If either file exists, tell the user a transcript is already there, quote
+   the path, and wait. Run only after they confirm. Pass `--force` only when
+   they want a new ASR pass; a plain re-run rewrites the `.txt` from the JSON
+   (`TRANSCRIPT_CACHE: hit`) and does not re-transcribe.
+3. If neither file exists, run `yt-transcribe.py <id>` now. Timeout ≥ 1800s.
+4. Read `ASR_QUALITY:`, exit code, and `TRANSCRIPT_FILE:`.
+5. On success, **show the user the path to the `.txt`** (and optionally a short
    preview). Do **not** chain into yt-summarize unless the user asks.
-
-Re-running with a cache hit rewrites the `.txt` from the JSON without ASR
-(`TRANSCRIPT_CACHE: hit`). Use `--force` to re-transcribe.
 
 ## Exit codes
 
