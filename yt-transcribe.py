@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
@@ -179,6 +180,179 @@ def _tail(output: str | None, lines: int = 5) -> str:
     """Last few lines of captured output, formatted for an error message."""
     body = "\n".join((output or "").strip().splitlines()[-lines:])
     return f"\n{body}" if body else ""
+
+
+# whisper-cli logs every VAD segment to stderr (~3 lines each). A talking
+# video is thousands of those lines, and an agent prefills the whole tool
+# result just to read ASR_QUALITY. Lift a few summary fields instead.
+_SEGMENT_RE = re.compile(
+    r"^(?:whisper_vad: Including segment \d+:"
+    r"|whisper_vad: vad_segment_info:"
+    r"|whisper_vad_segments_from_probs: VAD segment \d+:)"
+)
+_PROGRESS_RE = re.compile(
+    r"whisper_print_progress_callback: progress\s*=\s*(\d+)%"
+)
+_ERROR_RE = re.compile(r"(?i)(?:\berror\b|\bfatal\b|\bfailed\b|\bexception\b)")
+_DETECTED_RE = re.compile(r"^whisper_vad: detected (\d+) speech segments")
+_SPEECH_SECS_RE = re.compile(
+    r"^whisper_vad: total duration of speech segments:\s*([\d.]+) seconds"
+)
+_REDUCED_RE = re.compile(
+    r"^whisper_vad: Reduced audio from .+ \(([\d.]+)% reduction\)"
+)
+_MERGED_RE = re.compile(
+    r"^whisper_vad_segments_from_probs: Merged (\d+) adjacent segments"
+)
+_TOTAL_MS_RE = re.compile(
+    r"^whisper_print_timings:\s+total time\s*=\s*([\d.]+)\s*ms"
+)
+_VAD_ENABLED_RE = re.compile(r"^whisper_(?:full|vad): VAD is enabled")
+_SWALLOW_RE = re.compile(
+    r"^(?:whisper_vad_segments_from_probs: (?:detecting speech timestamps|Final speech segments)"
+    r"|whisper_full_with_state: auto-detected language:)"
+)
+
+
+class EngineLogFilter:
+    """Keep a few VAD/ASR summary lines from an engine's stderr.
+
+    Per-segment VAD lines and ggml/metal init chatter are counted and dropped.
+    Error lines and coarse progress (25/50/75/100) are printed as they arrive.
+    Call `finish` after the process exits to print the summary.
+    """
+
+    def __init__(self) -> None:
+        self.dropped_segments = 0
+        self.dropped_other = 0
+        self.stderr_tail: list[str] = []
+        self.vad_enabled = False
+        self.segments: str | None = None
+        self.speech_seconds: str | None = None
+        self.reduced_pct: str | None = None
+        self.merged: str | None = None
+        self.total_ms: str | None = None
+        self._progress_seen: set[int] = set()
+
+    def feed(self, line: str) -> None:
+        text = line.rstrip("\n")
+        if text:
+            self.stderr_tail.append(text)
+            del self.stderr_tail[:-40]
+        if not text.strip():
+            return
+        if _ERROR_RE.search(text):
+            print(text, flush=True)
+            return
+        if _SEGMENT_RE.match(text):
+            self.dropped_segments += 1
+            return
+        progress = _PROGRESS_RE.search(text)
+        if progress:
+            pct = int(progress.group(1))
+            for mark in (25, 50, 75, 100):
+                if pct >= mark and mark not in self._progress_seen:
+                    self._progress_seen.add(mark)
+                    print(f"ASR_PROGRESS: {mark}%", flush=True)
+            self.dropped_other += 1
+            return
+        if self._absorb_summary(text):
+            return
+        self.dropped_other += 1
+
+    def _absorb_summary(self, text: str) -> bool:
+        if _VAD_ENABLED_RE.match(text):
+            self.vad_enabled = True
+            return True
+        matched = _DETECTED_RE.match(text)
+        if matched:
+            self.segments = matched.group(1)
+            return True
+        matched = _SPEECH_SECS_RE.match(text)
+        if matched:
+            self.speech_seconds = matched.group(1)
+            return True
+        matched = _REDUCED_RE.match(text)
+        if matched:
+            self.reduced_pct = matched.group(1)
+            return True
+        matched = _MERGED_RE.match(text)
+        if matched:
+            self.merged = matched.group(1)
+            return True
+        matched = _TOTAL_MS_RE.match(text)
+        if matched:
+            self.total_ms = matched.group(1)
+            return True
+        return _SWALLOW_RE.match(text) is not None
+
+    def finish(self) -> None:
+        if self.segments:
+            bits = [f"{self.segments} speech segments"]
+            if self.speech_seconds:
+                bits.append(f"{_round_num(self.speech_seconds)}s speech")
+            if self.reduced_pct:
+                bits.append(f"{self.reduced_pct}% audio removed")
+            if self.merged:
+                bits.append(f"merged {self.merged} adjacent")
+            print("VAD: " + ", ".join(bits), flush=True)
+        elif self.vad_enabled:
+            print("VAD: enabled", flush=True)
+        if self.total_ms:
+            seconds = float(self.total_ms) / 1000.0
+            print(f"ASR_TIME: {seconds:.0f}s", flush=True)
+        omitted: list[str] = []
+        if self.dropped_segments:
+            omitted.append(f"{self.dropped_segments} per-segment VAD lines")
+        if self.dropped_other:
+            omitted.append(f"{self.dropped_other} other engine lines")
+        if omitted:
+            print("ENGINE_LOG: omitted " + " and ".join(omitted), flush=True)
+
+
+def _round_num(text: str) -> str:
+    value = float(text)
+    if value >= 10:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+def run_engine(cmd: list[str]) -> tuple[int, str, EngineLogFilter]:
+    """Run an ASR engine, capturing stdout and filtering stderr.
+
+    stdout is the transcript whisper would print; callers read the JSON file
+    instead, so it is kept only for the error tail. stderr is filtered live.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    stdout_box: list[str] = []
+
+    def _read_stdout() -> None:
+        assert proc.stdout is not None
+        stdout_box.append(proc.stdout.read() or "")
+
+    thread = threading.Thread(target=_read_stdout, daemon=True)
+    thread.start()
+    engine_log = EngineLogFilter()
+    assert proc.stderr is not None
+    for line in proc.stderr:
+        engine_log.feed(line)
+    code = proc.wait()
+    thread.join()
+    engine_log.finish()
+    return code if code is not None else 1, stdout_box[0] if stdout_box else "", engine_log
+
+
+def _engine_failure(name: str, code: int, stdout: str, engine_log: EngineLogFilter) -> str:
+    detail = _tail("\n".join(engine_log.stderr_tail), lines=20)
+    if not detail.strip():
+        detail = _tail(stdout)
+    return f"{name} exited {code}{detail}"
 
 
 def human_bytes(n: int) -> str:
@@ -418,6 +592,7 @@ class WhisperCppBackend(Backend):
                 "--file", str(wav),
                 "--output-json",
                 "--output-file", str(out_prefix),
+                "--no-prints",
                 "--print-progress",
             ]
             cmd += ["--language", lang if lang != "auto" else "auto"]
@@ -432,13 +607,13 @@ class WhisperCppBackend(Backend):
             cmd += opts.extra_args
 
             print(f"ASR: {self.label} · {model.key}", flush=True)
-            # stdout is captured only to keep the plain-text transcript off the
-            # console (we read the JSON file instead); stderr streams through so
-            # progress and engine diagnostics stay visible live.
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-            if proc.returncode != 0:
+            # --no-prints keeps the transcript off stdout (the JSON file is the
+            # source of segments). stderr is filtered down to a few VAD lines
+            # so an agent does not prefill every segment whisper logs.
+            code, stdout, engine_log = run_engine(cmd)
+            if code != 0:
                 raise RuntimeError(
-                    f"whisper-cli exited {proc.returncode}{_tail(proc.stdout)}"
+                    _engine_failure("whisper-cli", code, stdout, engine_log)
                 )
 
             json_path = out_prefix.with_suffix(".json")
@@ -536,10 +711,10 @@ class MlxWhisperBackend(Backend):
             cmd += opts.extra_args
 
             print(f"ASR: {self.label} · {model.key}", flush=True)
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
-            if proc.returncode != 0:
+            code, stdout, engine_log = run_engine(cmd)
+            if code != 0:
                 raise RuntimeError(
-                    f"mlx_whisper exited {proc.returncode}{_tail(proc.stdout)}"
+                    _engine_failure("mlx_whisper", code, stdout, engine_log)
                 )
 
             produced = sorted(Path(td).glob("*.json"))

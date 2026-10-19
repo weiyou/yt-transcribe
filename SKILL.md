@@ -69,7 +69,9 @@ When the user asks for a transcript, or yt-summarize has reported
    they want a new ASR pass; a plain re-run rewrites the `.txt` from the JSON
    (`TRANSCRIPT_CACHE: hit`) and does not re-transcribe.
 3. If neither file exists, run `yt-transcribe.py <id>` now. Timeout ≥ 1800s.
-4. Read `ASR_QUALITY:`, exit code, and `TRANSCRIPT_FILE:`.
+4. Read `ASR_QUALITY:`, exit code, `TRANSCRIPT_FILE:`, and the short `VAD:` /
+   `ASR_TIME:` lines. That is the whole engine summary. Do **not** open the
+   `.txt` or any engine log just to describe the run.
 5. On success, **show the user the path to the `.txt`** (and optionally a short
    preview). Do **not** chain into yt-summarize unless the user asks.
 
